@@ -29,12 +29,15 @@ This simple database supports one table with the following schema:
 The database supports the following commands:
 - `insert <id> <username> <email>`: Inserts a new row into the database.
 - `select`: Retrieves and displays all rows in the database.
-- `bulk_insert` inserts 1000 rows with random data for testing purposes.
+- `find <id>`: Searches for a row by its ID and displays it if found.
+- `bulk_insert` inserts rows from "sample_data.txt" file for testing.
 
 Meta commands:
 - `.exit`: Exits the database program and frees allocated memory.
 - `.btree`: Displays the structure of the B+ tree.
 - `.constants`: Displays constants used in the database.
+- `.help`: Displays help information about available commands.
+- `.cache`: Displays LRU cache structure.
 
 ---
 ## Building and Running
@@ -57,3 +60,7 @@ This project follows this excellent step-by-step tutorial [DB Tutorial](https://
 - Disk persistence through simple file-based storage.
 
 I built upon this foundation by adding new utilities and experimenting with different aspects of the database to understand each component in depth.
+Things I added: 
+- select <id> command to search for a row by ID.
+- LRU Cache to optimize read operations.
+- bulk_insert command to insert multiple rows from a file.

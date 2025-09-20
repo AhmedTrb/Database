@@ -43,7 +43,7 @@ uint32_t dequeue(Queue* q) {
 int is_empty(Queue* q) {
     return q->front == NULL;
 }
-
+// reding an entire line in c function
 ssize_t my_getline(char **lineptr, size_t *n, FILE *stream) {
   if (lineptr == NULL || n == NULL || stream == NULL) {
     return -1; // Invalid arguments
@@ -116,7 +116,7 @@ typedef enum {
   PREPARE_UNRECOGNIZED_STATEMENT
 } PrepareResult;
 
-typedef enum { STATEMENT_INSERT, STATEMENT_SELECT,BULK_INSERT } StatementType;
+typedef enum { STATEMENT_INSERT, STATEMENT_SELECT,BULK_INSERT,STATEMENT_SELECT_ONE } StatementType;
 
 #define COLUMN_USERNAME_SIZE 32
 #define COLUMN_EMAIL_SIZE 255
@@ -128,7 +128,8 @@ typedef struct {
 
 typedef struct {
   StatementType type;
-  Row row_to_insert;  // only used by insert statement
+  Row row_to_insert;// only used by insert statement
+  uint32_t id;
 } Statement;
 
 #define size_of_attribute(Struct, Attribute) sizeof(((Struct*)0)->Attribute)
@@ -143,14 +144,91 @@ const uint32_t ROW_SIZE = ID_SIZE + USERNAME_SIZE + EMAIL_SIZE;
 
 const uint32_t PAGE_SIZE = 4096;
 #define TABLE_MAX_PAGES 400
-
 #define INVALID_PAGE_NUM UINT32_MAX
 
+// -------------------------------- LRU cache --------------------------------
+/*
+ * For simplicity instead of using a hash table I just used a table with the page_num
+ * as a key to check if page exists in cache
+ */
+typedef struct PageNode {
+  uint32_t page_num;
+  void* page_data;
+  bool dirty;                 // Track if this page has been modified
+  struct PageNode* prev;
+  struct PageNode* next;
+} PageNode;
+
+typedef struct {
+  PageNode* head;             // Most recently used
+  PageNode* tail;             // Least recently used
+  uint32_t capacity;
+  uint32_t size;
+  PageNode* table[TABLE_MAX_PAGES]; // Hash table for fast lookup
+} LRUCache;
+
+void lru_cache_init(LRUCache* cache, uint32_t capacity) {
+  cache->head = NULL;
+  cache->tail = NULL;
+  cache->capacity = capacity;
+  cache->size = 0;
+  memset(cache->table, 0, sizeof(cache->table));
+}
+PageNode* createPageNode() {
+  PageNode* newNode = (PageNode*)malloc(sizeof(PageNode));
+  newNode->page_num = 0;
+  newNode->page_data = NULL;
+  newNode->dirty = false;
+  newNode->prev = NULL;
+  newNode->next = NULL;
+  return newNode;
+}
+
+void move_to_front(LRUCache* cache, PageNode* node) {
+  // node already in front
+  if (cache->head == node) return;
+
+  // Remove node from its current position
+  if (node->prev) node->prev->next = node->next;
+  if (node->next) node->next->prev = node->prev;
+  if (cache->tail == node) cache->tail = node->prev;
+
+  // Insert node at the front
+  node->next = cache->head;
+  node->prev = NULL;
+  if (cache->head) cache->head->prev = node;
+  cache->head = node;
+  if (!cache->tail) cache->tail = node;
+}
+void insert_node(LRUCache* cache, PageNode* node) {
+  node->prev = NULL;
+  node->next = cache->head;
+  if (cache->head) cache->head->prev = node;
+  cache->head = node;
+  if (!cache->tail) cache->tail = node;
+  cache->size++;
+  cache->table[node->page_num] = node;
+}
+
+PageNode* evict_page(LRUCache* cache) {
+  if (cache->size == 0) return NULL;
+  PageNode* victim = cache->tail;
+
+  if (victim->prev) victim->prev->next = NULL;
+  cache->tail = victim->prev;
+  if (cache->tail == NULL) cache->head = NULL;
+  cache->size--;
+  cache->table[victim->page_num] = NULL;
+
+  return victim;
+}
+// ------------------------------ Pager and Table ------------------------------
 typedef struct {
   int file_descriptor;
   uint32_t file_length;
   uint32_t num_pages;
-  void* pages[TABLE_MAX_PAGES];
+  // void* pages[TABLE_MAX_PAGES];
+  LRUCache* cache;  // LRU cache for pages
 } Pager;
 
 typedef struct {
@@ -171,6 +249,7 @@ void print_row(Row* row) {
 
 typedef enum { NODE_INTERNAL, NODE_LEAF } NodeType;
 
+// ------------------------------ B+ Tree Nodes -------------------------------
 /*
  * Common Node Header Layout
  */
@@ -312,41 +391,243 @@ uint32_t* leaf_node_key(void* node, uint32_t cell_num) {
 void* leaf_node_value(void* node, uint32_t cell_num) {
   return leaf_node_cell(node, cell_num) + LEAF_NODE_KEY_SIZE;
 }
+// ------------------------ Pager and Table Functions ------------------------
+/* Mark a page as dirty in the pager's cache.
+   Call this whenever you modify a page's content in memory. */
+void mark_page_dirty(Pager* pager, uint32_t page_num) {
+  if (!pager || !pager->cache) return;
+  if (page_num >= pager->cache->capacity) return;
+  PageNode* node = pager->cache->table[page_num];
+  if (node) node->dirty = true;
+}
 
-void* get_page(Pager* pager, uint32_t page_num) {
-  if (page_num > TABLE_MAX_PAGES) {
-    printf("Tried to fetch page number out of bounds. %d > %d\n", page_num,
-           TABLE_MAX_PAGES);
+/* Robust write helper: write exactly len bytes, retry on EINTR, handle short writes */
+static ssize_t write_all(int fd, const void *buf, size_t len) {
+  const char *p = (const char*)buf;
+  size_t remaining = len;
+  while (remaining > 0) {
+    ssize_t written = write(fd, p, remaining);
+    if (written < 0) {
+      if (errno == EINTR) continue;
+      return -1; // real error
+    }
+    remaining -= (size_t)written;
+    p += written;
+  }
+  return (ssize_t)len;
+}
+
+/* Flush an arbitrary page buffer to disk at page_num.
+   Use this when you have the buffer in-hand (e.g. evicted node). */
+void pager_flush_page_data(Pager* pager, uint32_t page_num, void* page_data) {
+  if (!pager || !page_data) {
+    fprintf(stderr, "pager_flush_page_data: null argument\n");
     exit(EXIT_FAILURE);
   }
 
-  if (pager->pages[page_num] == NULL) {
-    // Cache miss. Allocate memory and load from file.
-    void* page = malloc(PAGE_SIZE);
-    uint32_t num_pages = pager->file_length / PAGE_SIZE;
+  off_t offset = lseek(pager->file_descriptor, (off_t)page_num * PAGE_SIZE, SEEK_SET);
+  if (offset == (off_t)-1) {
+    fprintf(stderr, "Error seeking to page %u: %s\n", page_num, strerror(errno));
+    exit(EXIT_FAILURE);
+  }
 
-    // We might save a partial page at the end of the file
-    if (pager->file_length % PAGE_SIZE) {
-      num_pages += 1;
-    }
+  if (write_all(pager->file_descriptor, page_data, PAGE_SIZE) == -1) {
+    fprintf(stderr, "Error writing page %u: %s\n", page_num, strerror(errno));
+    exit(EXIT_FAILURE);
+  }
 
-    if (page_num < num_pages) {
-      lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
-      ssize_t bytes_read = read(pager->file_descriptor, page, PAGE_SIZE);
-      if (bytes_read == -1) {
-        printf("Error reading file: %d\n", errno);
-        exit(EXIT_FAILURE);
+  /* Update file_length / num_pages if we extended the file */
+  off_t endpos = lseek(pager->file_descriptor, 0, SEEK_END);
+  if (endpos == (off_t)-1) {
+    fprintf(stderr, "Error seeking to end after write: %s\n", strerror(errno));
+    exit(EXIT_FAILURE);
+  }
+  pager->file_length = (uint32_t)endpos;
+  pager->num_pages = (uint32_t)(pager->file_length / PAGE_SIZE);
+  if (pager->file_length % PAGE_SIZE) pager->num_pages += 1;
+}
+void* get_page(Pager* pager, uint32_t page_num) {
+  if (page_num > TABLE_MAX_PAGES) {
+    printf("Tried to fetch page number out of bounds. %u > %u\n",
+           page_num, TABLE_MAX_PAGES);
+    exit(EXIT_FAILURE);
+  }
+
+  LRUCache* cache = pager->cache;
+  if (!cache) {
+    fprintf(stderr, "Pager cache is not initialized\n");
+    exit(EXIT_FAILURE);
+  }
+
+  /* --- 1) Cache hit? --- */
+  PageNode* node = cache->table[page_num];
+  if (node) {
+    /* mark as most recently used */
+    move_to_front(cache, node);
+    return node->page_data;
+  }
+
+  /* --- 2) Cache miss --- */
+  /* If cache full, evict LRU */
+  if (cache->size >= cache->capacity) {
+    PageNode* victim = evict_page(cache); /* victim has been removed from list & table, cache->size decremented */
+
+    if (victim) {
+      /* Flush victim if dirty */
+      if (victim->dirty) {
+        pager_flush_page_data(pager, victim->page_num, victim->page_data);
       }
-    }
 
-    pager->pages[page_num] = page;
+      /*
+       * Reuse the victim node's buffer to avoid extra malloc/free.
+       * victim was removed from cache->table by evict_page(), so it's safe to
+       * repurpose it for the new page.
+       */
+      uint32_t num_pages = pager->file_length / PAGE_SIZE;
+      if (pager->file_length % PAGE_SIZE) num_pages += 1;
 
-    if (page_num >= pager->num_pages) {
-      pager->num_pages = page_num + 1;
+      if (page_num < num_pages) {
+        off_t off = lseek(pager->file_descriptor, (off_t)page_num * PAGE_SIZE, SEEK_SET);
+        if (off == -1) {
+          printf("Error seeking while reading page %u: %d\n", page_num, errno);
+          exit(EXIT_FAILURE);
+        }
+        ssize_t bytes_read = read(pager->file_descriptor, victim->page_data, PAGE_SIZE);
+        if (bytes_read == -1) {
+          printf("Error reading file: %d\n", errno);
+          exit(EXIT_FAILURE);
+        }
+      } else {
+        /* New page beyond EOF -> initialize to zero */
+        memset(victim->page_data, 0, PAGE_SIZE);
+      }
+
+      victim->page_num = page_num;
+      victim->dirty = false;
+      /* Put reused node at front (MRU) and install into hash-table */
+      insert_node(cache, victim);
+
+      if (page_num >= pager->num_pages) pager->num_pages = page_num + 1;
+
+      return victim->page_data;
     }
   }
 
-  return pager->pages[page_num];
+  /* --- 3) Cache has free space: create new node --- */
+  PageNode* new_node = createPageNode();
+  if (!new_node) {
+    printf("Unable to allocate PageNode\n");
+    exit(EXIT_FAILURE);
+  }
+
+  new_node->page_num = page_num;
+  new_node->page_data = malloc(PAGE_SIZE);
+  if (!new_node->page_data) {
+    printf("Unable to allocate page buffer\n");
+    exit(EXIT_FAILURE);
+  }
+  new_node->dirty = false;
+  new_node->prev = new_node->next = NULL;
+
+  uint32_t num_pages = pager->file_length / PAGE_SIZE;
+  if (pager->file_length % PAGE_SIZE) num_pages += 1;
+
+  if (page_num < num_pages) {
+    off_t off = lseek(pager->file_descriptor, (off_t)page_num * PAGE_SIZE, SEEK_SET);
+    if (off == -1) {
+      printf("Error seeking while reading page %u: %d\n", page_num, errno);
+      exit(EXIT_FAILURE);
+    }
+    ssize_t bytes_read = read(pager->file_descriptor, new_node->page_data, PAGE_SIZE);
+    if (bytes_read == -1) {
+      printf("Error reading file: %d\n", errno);
+      exit(EXIT_FAILURE);
+    }
+  } else {
+    memset(new_node->page_data, 0, PAGE_SIZE);
+  }
+
+  insert_node(cache, new_node);
+
+  if (page_num >= pager->num_pages) pager->num_pages = page_num + 1;
+
+  return new_node->page_data;
+}
+/* Flush the page currently held in cache (if loaded). Clears dirty bit on success.
+   Use this when the page is still in the cache. */
+void pager_flush(Pager* pager, uint32_t page_num) {
+  if (!pager || !pager->cache) return;
+
+  if (page_num >= TABLE_MAX_PAGES) {
+    fprintf(stderr, "pager_flush: page_num out of range %u\n", page_num);
+    return;
+  }
+
+  PageNode* node = pager->cache->table[page_num];
+  if (!node) {
+    /* page not in cache -> nothing to flush */
+    return;
+  }
+
+  if (!node->dirty) {
+    /* nothing to do */
+    return;
+  }
+
+  pager_flush_page_data(pager, page_num, node->page_data);
+  node->dirty = false;
+}
+
+/* Close pager: flush dirty pages from the LRU cache, free nodes, free cache, close FD. */
+void pager_close(Pager* pager) {
+  if (!pager) return;
+
+  LRUCache* cache = pager->cache;
+  if (cache) {
+    /* Walk list from head and flush dirty nodes, then free nodes */
+    PageNode* cur = cache->head;
+    while (cur) {
+      PageNode* next = cur->next;
+      if (cur->dirty) {
+        pager_flush_page_data(pager, cur->page_num, cur->page_data);
+        cur->dirty = false;
+      }
+      /* free buffer and node */
+      if (cur->page_data) {
+        free(cur->page_data);
+        cur->page_data = NULL;
+      }
+      free(cur);
+      cur = next;
+    }
+
+    /* zero out table slots (not strictly required since we free cache) */
+    memset(cache->table, 0, sizeof(cache->table));
+    free(cache);
+    pager->cache = NULL;
+  }
+
+  /* Close file descriptor */
+  if (pager->file_descriptor != -1) {
+    if (close(pager->file_descriptor) == -1) {
+      fprintf(stderr, "Error closing db file: %s\n", strerror(errno));
+      /* not exiting here because we're already closing down */
+    }
+    pager->file_descriptor = -1;
+  }
+
+  /* free pager struct itself (caller should free Table) */
+  free(pager);
+}
+
+/* Update db_close to use pager_close and free Table */
+void db_close(Table* table) {
+  if (!table) return;
+  Pager* pager = table->pager;
+  if (pager) {
+    pager_close(pager);
+  }
+  free(table);
 }
 
 uint32_t get_node_max_key(Pager* pager, void* node) {
@@ -575,32 +856,65 @@ void cursor_advance(Cursor* cursor) {
   }
 }
 
-Pager* pager_open(const char* filename) {int fd = open(filename,
-                  O_RDWR | O_CREAT,  // read/write + create if not exists
-                  S_IWUSR | S_IRUSR  // user can read and write
-    );
+Pager* pager_open(const char* filename) {
+  int fd = open(filename,
+                O_RDWR | O_CREAT,      // read/write + create if not exists
+                S_IWUSR | S_IRUSR      // user can read and write
+  );
 
   if (fd == -1) {
-    printf("Unable to open file\n");
+    perror("Unable to open file");
     exit(EXIT_FAILURE);
   }
 
   off_t file_length = lseek(fd, 0, SEEK_END);
-
-  Pager* pager = malloc(sizeof(Pager));
-  pager->file_descriptor = fd;
-  pager->file_length = file_length;
-  pager->num_pages = (file_length / PAGE_SIZE);
-
-  if (file_length % PAGE_SIZE != 0) {
-    printf("Db file is not a whole number of pages. Corrupt file.\n");
+  if (file_length == (off_t)-1) {
+    perror("lseek");
+    close(fd);
     exit(EXIT_FAILURE);
   }
 
-  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
-    pager->pages[i] = NULL;
+  /* Create and initialize the LRU cache.
+   * Cap capacity to TABLE_MAX_PAGES to avoid out-of-bounds lookups
+   * since your simple table-based hash uses page_num as an index.
+   */
+  const uint32_t requested_capacity = 100; /* you can tune this */
+  uint32_t capacity = requested_capacity;
+  if (capacity > TABLE_MAX_PAGES) capacity = TABLE_MAX_PAGES;
+
+  LRUCache* cache = malloc(sizeof(LRUCache));
+  if (!cache) {
+    fprintf(stderr, "Failed to allocate LRUCache\n");
+    close(fd);
+    exit(EXIT_FAILURE);
+  }
+  lru_cache_init(cache, capacity); // zeroes cache->table[] internally
+
+  /* Allocate pager and set fields */
+  Pager* pager = malloc(sizeof(Pager));
+  if (!pager) {
+    fprintf(stderr, "Failed to allocate Pager\n");
+    free(cache);
+    close(fd);
+    exit(EXIT_FAILURE);
   }
 
+  pager->file_descriptor = fd;
+  pager->file_length = (uint32_t)file_length;
+  pager->num_pages = (uint32_t)(file_length / PAGE_SIZE); /* integer division */
+
+  /* If file_length is not multiple of PAGE_SIZE, something's wrong.
+     Keep the original behavior (you can also choose to handle a partial final page). */
+  if (file_length % PAGE_SIZE != 0) {
+    fprintf(stderr, "Db file is not a whole number of pages. Corrupt file.\n");
+    /* cleanup */
+    free(pager);
+    free(cache);
+    close(fd);
+    exit(EXIT_FAILURE);
+  }
+
+  pager->cache = cache;
   return pager;
 }
 
@@ -616,6 +930,7 @@ Table* db_open(const char* filename) {
     void* root_node = get_page(pager, 0);
     initialize_leaf_node(root_node);
     set_node_root(root_node, true);
+    mark_page_dirty(pager, 0);
   }
 
   return table;
@@ -650,57 +965,25 @@ void close_input_buffer(InputBuffer* input_buffer) {
   free(input_buffer->buffer);
   free(input_buffer);
 }
+// Visualize the LRU Cache state
+void lru_cache_print(LRUCache* cache) {
+  printf("\n=== LRU Cache ===\n");
+  printf("Size: %u / %u\n", cache->size, cache->capacity);
+  printf("Order: [MRU --> ... --> LRU]\n\n");
 
-void pager_flush(Pager* pager, uint32_t page_num) {
-  if (pager->pages[page_num] == NULL) {
-    printf("Tried to flush null page\n");
-    exit(EXIT_FAILURE);
-  }
-
-  off_t offset = lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
-
-  if (offset == -1) {
-    printf("Error seeking: %d\n", errno);
-    exit(EXIT_FAILURE);
-  }
-
-  ssize_t bytes_written =
-      write(pager->file_descriptor, pager->pages[page_num], PAGE_SIZE);
-
-  if (bytes_written == -1) {
-    printf("Error writing: %d\n", errno);
-    exit(EXIT_FAILURE);
-  }
-}
-
-void db_close(Table* table) {
-  Pager* pager = table->pager;
-
-  for (uint32_t i = 0; i < pager->num_pages; i++) {
-    if (pager->pages[i] == NULL) {
-      continue;
+  PageNode* current = cache->head;
+  while (current) {
+    printf("[Page %u | dirty:%s]",
+           current->page_num,
+           current->dirty ? "true" : "false");
+    if (current->next) {
+      printf(" <-> "); // Shows the doubly-linked nature
     }
-    pager_flush(pager, i);
-    free(pager->pages[i]);
-    pager->pages[i] = NULL;
+    current = current->next;
   }
-
-  int result = close(pager->file_descriptor);
-  if (result == -1) {
-    printf("Error closing db file.\n");
-    exit(EXIT_FAILURE);
-  }
-  for (uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
-    void* page = pager->pages[i];
-    if (page) {
-      free(page);
-      pager->pages[i] = NULL;
-    }
-  }
-  free(pager);
-  free(table);
+  printf("\n\n");
 }
-
+void bulk_insert(const char* filename, Table* table);
 
 MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
   if (strcmp(input_buffer->buffer, ".exit") == 0) {
@@ -714,6 +997,27 @@ MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
   } else if (strcmp(input_buffer->buffer, ".constants") == 0) {
     printf("Constants:\n");
     print_constants();
+    return META_COMMAND_SUCCESS;
+  } else if (strcmp(input_buffer->buffer, ".cache") == 0) {
+    printf("Cache:\n");
+    lru_cache_print(table->pager->cache);
+    return META_COMMAND_SUCCESS;
+  } else if (strcmp(input_buffer->buffer, ".help") == 0) {
+    printf("Supported commands:\n");
+    printf(".exit         - Exit the program\n");
+    printf(".btree        - Print the B+ tree structure\n");
+    printf(".constants    - Print the constants used in the database\n");
+    printf(".cache        - Print the current state of the LRU cache\n");
+    printf(".bulk_insert   - Insert 1000 records for testing\n");
+    printf(".help         - Show this help message\n");
+    printf("insert <id> <username> <email> - Insert a new record\n");
+    printf("select        - Display all records\n");
+    printf(".select <id>   - select a specific row with id\n");
+
+    return META_COMMAND_SUCCESS;
+  } else if (strcmp(input_buffer->buffer, ".bulk_insert") == 0) {
+    printf("Bulk inserting from 'sample_data.txt'...\n");
+    bulk_insert("sample_data.txt", table);
     return META_COMMAND_SUCCESS;
   } else {
     return META_COMMAND_UNRECOGNIZED_COMMAND;
@@ -754,6 +1058,21 @@ PrepareResult prepare_statement(InputBuffer* input_buffer,
                                 Statement* statement) {
   if (strncmp(input_buffer->buffer, "insert", 6) == 0) {
     return prepare_insert(input_buffer, statement);
+  }
+  if (strncmp(input_buffer->buffer, "select ", 7) == 0) {
+    // Parse the ID after "select "
+    char* id_str = input_buffer->buffer + 7;
+    char* endptr;
+    uint32_t id = strtoul(id_str, &endptr, 10);
+
+    if (endptr == id_str) {
+      // No number parsed
+      return PREPARE_SYNTAX_ERROR;
+    }
+
+    statement->type = STATEMENT_SELECT_ONE;
+    statement->id = id;
+    return PREPARE_SUCCESS;
   }
   if (strcmp(input_buffer->buffer, "select") == 0) {
     statement->type = STATEMENT_SELECT;
@@ -816,6 +1135,10 @@ void create_new_root(Table* table, uint32_t right_child_page_num) {
   *internal_node_right_child(root) = right_child_page_num;
   *node_parent(left_child) = table->root_page_num;
   *node_parent(right_child) = table->root_page_num;
+
+  mark_page_dirty(table->pager, left_child_page_num);
+  mark_page_dirty(table->pager, table->root_page_num);      // new root
+  mark_page_dirty(table->pager, right_child_page_num);
 }
 
 void internal_node_split_and_insert(Table* table, uint32_t parent_page_num,
@@ -856,7 +1179,7 @@ void internal_node_insert(Table* table, uint32_t parent_page_num,
   of creating a new key at (max_cells + 1) with an uninitialized value
   */
   *internal_node_num_keys(parent) = original_num_keys + 1;
-
+  mark_page_dirty(table->pager, parent_page_num);
   if (child_max_key > get_node_max_key(table->pager, right_child)) {
     /* Replace right child */
     *internal_node_child(parent, original_num_keys) = right_child_page_num;
@@ -1020,6 +1343,10 @@ void leaf_node_split_and_insert(Cursor* cursor, uint32_t key, Row* value) {
   *(leaf_node_num_cells(old_node)) = LEAF_NODE_LEFT_SPLIT_COUNT;
   *(leaf_node_num_cells(new_node)) = LEAF_NODE_RIGHT_SPLIT_COUNT;
 
+  /* mark both pages dirty */
+  mark_page_dirty(cursor->table->pager, cursor->page_num);
+  mark_page_dirty(cursor->table->pager, new_page_num);
+
   if (is_node_root(old_node)) {
     return create_new_root(cursor->table, new_page_num);
   } else {
@@ -1054,6 +1381,9 @@ void leaf_node_insert(Cursor* cursor, uint32_t key, Row* value) {
   *(leaf_node_num_cells(node)) += 1;
   *(leaf_node_key(node, cursor->cell_num)) = key;
   serialize_row(value, leaf_node_value(node, cursor->cell_num));
+
+  // Mark page as dirty to ensure it gets written to disk
+  mark_page_dirty(cursor->table->pager, cursor->page_num);
 }
 
 ExecuteResult execute_insert(Statement* statement, Table* table) {
@@ -1092,26 +1422,82 @@ ExecuteResult execute_select(Statement* statement, Table* table) {
 
   return EXECUTE_SUCCESS;
 }
-void bulk_insert(Table* table, int count) {
-  for (int i = 1; i <= count; i++) {
-    Row row;
-    row.id = i;
-    snprintf(row.username, sizeof(row.username), "user%d", i);
-    snprintf(row.email, sizeof(row.email), "user%d@example.com", i);
-
-    Cursor* cursor = table_find(table, row.id);  // Find insertion point
-    leaf_node_insert(cursor, row.id, &row);      // Insert into B+Tree
-    free(cursor);
+ExecuteResult execute_select_id(Statement* statement, Table* table) {
+  Cursor* cursor = table_find(table, statement->id);  // B+Tree search
+  if (cursor == NULL) {
+    printf("Row with id %u not found.\n", statement->id);
+    return;
   }
+
+  if (cursor->end_of_table) {
+    printf("Row with id %u not found.\n", statement->id);
+    return;
+  }
+
+  void* value = cursor_value(cursor);
+  Row row;
+  deserialize_row(value, &row);
+
+  print_row(&row);
+  free(cursor);
+  return EXECUTE_SUCCESS;
+}
+
+void bulk_insert(const char* filename, Table* table) {
+  FILE* file = fopen(filename, "r");
+  if (!file) {
+    printf("Could not open file: %s\n", filename);
+    return;
+  }
+
+  char line[512];
+  uint32_t row_count = 0;
+
+  while (fgets(line, sizeof(line), file)) {
+    // Trim newline
+    line[strcspn(line, "\n")] = 0;
+
+    // Parse line: id username email
+    uint32_t id;
+    char username[COLUMN_USERNAME_SIZE + 1];
+    char email[COLUMN_EMAIL_SIZE + 1];
+
+    int fields = sscanf(line, "%u %32s %255s", &id, username, email);
+    if (fields != 3) {
+      printf("Skipping invalid line: %s\n", line);
+      continue;
+    }
+
+    Row row;
+    row.id = id;
+    strncpy(row.username, username, COLUMN_USERNAME_SIZE);
+    row.username[COLUMN_USERNAME_SIZE] = '\0';
+    strncpy(row.email, email, COLUMN_EMAIL_SIZE);
+    row.email[COLUMN_EMAIL_SIZE] = '\0';
+
+    // Insert using existing logic
+    Statement statement;
+    statement.type = STATEMENT_INSERT;
+    statement.row_to_insert = row;
+    ExecuteResult result = execute_insert(&statement, table);
+
+    if (result != EXECUTE_SUCCESS) {
+      printf("Insert failed for row: %u %s %s\n", id, username, email);
+    } else {
+      row_count++;
+    }
+  }
+
+  printf("Imported %u rows from %s\n", row_count, filename);
+  fclose(file);
 }
 
 ExecuteResult execute_statement(Statement* statement, Table* table) {
   switch (statement->type) {
-    case (BULK_INSERT):
-      bulk_insert(table, 15);
-      return EXECUTE_SUCCESS;
     case (STATEMENT_INSERT):
       return execute_insert(statement, table);
+    case (STATEMENT_SELECT_ONE):
+      return execute_select_id(statement, table);
     case (STATEMENT_SELECT):
       return execute_select(statement, table);
   }
